@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+/output/
+/refs/
+tests/cpp_ref/build/
+.DS_Store
