@@ -1,7 +1,7 @@
 # splash-converter
 
-Convert a Qwen3.8-27B-architecture BF16 checkpoint into a
-[Splash](https://github.com/incoai/splash) `splash-packed-q4` package.
+Convert Qwen3.8-27B BF16 or Qwen3.6-35B-A3B BF16/MLX 4-bit checkpoints into
+[Splash](https://github.com/incoai/splash) Q4 packages.
 
 Splash documents the package *shape* in `DEVELOPMENT.md` but ships no converter, so the
 byte-level layout — section offsets, tile-major packing order, the quantization rule, the
@@ -13,6 +13,10 @@ the result is at
 [SiliconSpecies/Swift-Qwen3.8-27B-Splash](https://huggingface.co/SiliconSpecies/Swift-Qwen3.8-27B-Splash).
 
 ## Usage
+
+For Qwen3.6 MoE and RavenX, see [the schema-4 guide](docs/QWEN36_MOE.md).
+The new backend is `python -m converter.qwen36_moe`; the commands below remain
+the Qwen3.8 dense backend.
 
 ```bash
 python -m converter.build layers    --source /path/to/bf16 --out output/pkg/target
@@ -30,12 +34,13 @@ is produced and the build stops at the first failure.
 
 - **Works**: any checkpoint with the Qwen3.8-27B layout (64 layers, hidden 5120,
   48 GDN + 16 full-attention), schema 3 / `splash-packed-q4`.
-- **Not implemented**: schema 4 / `splash-packed-q4-moe`; other architectures need a new
-  layout table in `converter/layer.py`.
+- **Qwen3.6 MoE**: schema 4 / `splash-packed-q4-moe` has a separate backend in
+  `converter/qwen36_moe.py`. It accepts BF16 or MLX affine 4-bit input; the
+  MLX 8-bit whole-model variant is not accepted.
 - `draft/` and `vision/` are byte-copied from an existing package — this converts the
   target model, not the DFlash 2 drafter or the vision tower.
 
-## Two things that will bite you
+## Qwen3.8 caveats
 
 **Every bf16 norm section stores γ + 1**, including `query-norm` and `key-norm`.
 `gdn-norm` is the lone exception and stores γ unchanged. Getting the attention norms wrong

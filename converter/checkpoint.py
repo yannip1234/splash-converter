@@ -53,6 +53,58 @@ class Checkpoint:
         header, _ = self._header(shard)
         return tuple(header[name]["shape"])
 
+    def dtype(self, name: str) -> str:
+        shard = self.weight_map[name]
+        header, _ = self._header(shard)
+        return header[name]["dtype"]
+
+    def tensor_rows_raw(self, name: str, start: int, stop: int,
+                        expert: int | None = None) -> bytes:
+        """Read contiguous rows of a rank-2 or rank-3 BF16/U32 tensor."""
+        shard = self.weight_map[name]
+        header, data_start = self._header(shard)
+        info = header[name]
+        shape = tuple(info["shape"])
+        if len(shape) == 2 and expert is None:
+            rows, cols = shape
+            outer = 0
+        elif len(shape) == 3 and expert is not None and 0 <= expert < shape[0]:
+            rows, cols = shape[1:]
+            outer = expert * rows
+        else:
+            raise ValueError(f"{name}: unsupported row slice for shape {shape}")
+        if not 0 <= start <= stop <= rows:
+            raise ValueError(f"{name}: row range {start}:{stop} outside {rows}")
+        item_bytes = {"BF16": 2, "U32": 4}.get(info["dtype"])
+        if item_bytes is None:
+            raise ValueError(f"{name}: unsupported dtype {info['dtype']}")
+        byte_start = data_start + info["data_offsets"][0] + (outer + start) * cols * item_bytes
+        size = (stop - start) * cols * item_bytes
+        with open(os.path.join(self.root, shard), "rb") as f:
+            f.seek(byte_start)
+            raw = f.read(size)
+        if len(raw) != size:
+            raise ValueError(f"{name}: short row read")
+        return raw
+
+    def f32_expert(self, name: str, expert: int) -> np.ndarray:
+        """Read one [out, in] slab from a [experts, out, in] BF16 tensor."""
+        shape = self.shape(name)
+        if len(shape) != 3 or not 0 <= expert < shape[0]:
+            raise ValueError(f"{name}: invalid expert {expert} for {shape}")
+        shard = self.weight_map[name]
+        header, data_start = self._header(shard)
+        if header[name]["dtype"] != "BF16":
+            raise ValueError(f"{name}: expected BF16")
+        elements = shape[1] * shape[2]
+        offset = data_start + header[name]["data_offsets"][0] + expert * elements * 2
+        with open(os.path.join(self.root, shard), "rb") as f:
+            f.seek(offset)
+            raw = f.read(elements * 2)
+        if len(raw) != elements * 2:
+            raise ValueError(f"{name}: short expert read")
+        return (np.frombuffer(raw, dtype="<u2").astype(np.uint32) << 16).view(np.float32).reshape(shape[1:])
+
     def raw(self, name: str) -> bytes:
         """The tensor's stored bytes, untouched — for byte-identical copies."""
         shard = self.weight_map[name]
