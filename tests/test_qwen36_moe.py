@@ -4,6 +4,7 @@ Full checkpoint and runtime checks are performed by the CLI's `validate`
 command on the conversion host and by Splash on Apple Silicon.
 """
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -20,7 +21,7 @@ from converter.qwen36_moe import (
 
 class Qwen36FormatTests(unittest.TestCase):
     @staticmethod
-    def geometry():
+    def config():
         text = {
             "model_type": "qwen3_5_moe_text", "num_hidden_layers": 40,
             "hidden_size": 2048, "vocab_size": 248320,
@@ -37,7 +38,11 @@ class Qwen36FormatTests(unittest.TestCase):
             "layer_types": ["full_attention" if (n + 1) % 4 == 0
                             else "linear_attention" for n in range(40)],
         }
-        return Geometry.from_config({"model_type": "qwen3_5_moe", "text_config": text})
+        return {"model_type": "qwen3_5_moe", "text_config": text}
+
+    @classmethod
+    def geometry(cls):
+        return Geometry.from_config(cls.config())
 
     def test_schema4_section_geometry(self):
         # Current Splash Qwen3.6 binary sizes, checked against its published
@@ -84,23 +89,25 @@ class Qwen36FormatTests(unittest.TestCase):
         self.assertEqual(codes[0].tolist(), list(range(8)) * 8)
 
     def test_local_mlx4_repack_preserves_values(self):
-        source = Path(__file__).parents[2] / (
-            "RavenX-CyberAgent-Qwen3.6-35B-A3B-Opus-4.7-OpenMythos-"
-            "Pentester-BugHunter-RATH-mlx-mlx-4Bit")
-        if not source.exists():
-            self.skipTest("local MLX 4-bit checkpoint unavailable")
+        source = os.environ.get("QWEN36_MLX4_SOURCE")
+        if not source:
+            self.skipTest("set QWEN36_MLX4_SOURCE for the optional full-checkpoint test")
         ck = Qwen36Checkpoint(str(source))
         ck.validate()
-        self.assertEqual((ck.source_mode, len(ck._required)), ("mlx4", 1757))
+        self.assertEqual(ck.source_mode, "mlx4")
         name = "language_model.model.layers.0.mlp.shared_expert.gate_proj.weight"
         packed = ck.pack_q4(name)
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "repacked.bin"
             path.write_bytes(packed)
             for row in (0, 255, 511):
-                self.assertTrue(np.array_equal(
-                    _q4_row(path, 0, 512, 2048, row),
-                    ck.f32_rows(name, row, row + 1)[0]))
+                decoded = _q4_row(path, 0, 512, 2048, row)
+                original = ck.f32_rows(name, row, row + 1)[0]
+                if ck.dtype(name) == "BF16":
+                    relative = np.linalg.norm(decoded - original) / max(np.linalg.norm(original), 1e-12)
+                    self.assertLess(relative, 0.20)
+                else:
+                    np.testing.assert_array_equal(decoded, original)
 
 
 if __name__ == "__main__":

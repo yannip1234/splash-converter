@@ -26,9 +26,14 @@ class Checkpoint:
     def __init__(self, root: str):
         self.root = root
         index_path = os.path.join(root, "model.safetensors.index.json")
-        with open(index_path) as f:
-            self.weight_map = json.load(f)["weight_map"]
         self._headers: dict[str, tuple[dict, int]] = {}
+        if os.path.isfile(index_path):
+            with open(index_path) as f:
+                self.weight_map = json.load(f)["weight_map"]
+        else:
+            header, _ = self._header("model.safetensors")
+            self.weight_map = {name: "model.safetensors" for name in header
+                               if name != "__metadata__"}
 
     def _header(self, shard: str):
         if shard not in self._headers:

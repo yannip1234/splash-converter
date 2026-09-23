@@ -30,12 +30,12 @@ def main(argv=None):
                    help="optional JSON mapping case IDs to original MLX responses")
     args = p.parse_args(argv)
     cases = [
-        {"id": "short", "messages": [{"role": "user", "content": "Explain SQL injection in one sentence."}]},
-        {"id": "ravenx_system", "messages": [
-            {"role": "system", "content": "You are RavenX. Answer as a concise security analyst."},
-            {"role": "user", "content": "Describe a safe first step for triaging a reported web vulnerability."}]},
+        {"id": "short", "messages": [{"role": "user", "content": "Explain why the sky is blue in one sentence."}]},
+        {"id": "system", "messages": [
+            {"role": "system", "content": "Answer concisely in plain English."},
+            {"role": "user", "content": "Describe a practical way to organize a busy day."}]},
         {"id": "tool_call", "messages": [
-            {"role": "user", "content": "Look up the current scope for project RATH using the provided tool."}],
+            {"role": "user", "content": "Look up the current scope for project example using the provided tool."}],
          "tools": [{"type": "function", "function": {
              "name": "lookup_scope", "description": "Return authorized project scope",
              "parameters": {"type": "object", "properties": {"project": {"type": "string"}},

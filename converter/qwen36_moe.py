@@ -24,14 +24,12 @@ import numpy as np
 from . import encoder, mlx_affine, q4
 from .checkpoint import Checkpoint
 from .layer import decay_bytes
+from .qwen36_metadata import reference_metadata, sha256, source_metadata
 
 ALIGN = 16_384
 LAYER_MAGIC = b"MDFM0001"
 HEAD_MAGIC = b"MDFM0002"
 EMBEDDING_MAGIC = b"MDFE0001"
-REFERENCE_ID = "incoai/Qwen3.6-35B-A3B-Splash"
-RAVENX_ID = "deadbydawn101/RavenX-CyberAgent-Qwen3.6-35B-A3B-Opus-4.7-OpenMythos-Pentester-BugHunter-RATH-mlx"
-RAVENX_MLX4_ID = "Ck-TnT/RavenX-CyberAgent-Qwen3.6-35B-A3B-Opus-4.7-OpenMythos-Pentester-BugHunter-RATH-mlx-mlx-4Bit"
 
 
 def align(value: int) -> int:
@@ -130,6 +128,11 @@ class Qwen36Checkpoint(Checkpoint):
             self.config = json.load(f)
         self.geometry = Geometry.from_config(self.config)
         quant = self.config.get("quantization_config")
+        alias = self.config.get("quantization")
+        if quant is not None and alias is not None and quant != alias:
+            raise ValueError("conflicting quantization_config and quantization")
+        self.quantization = quant if quant is not None else alias
+        quant = self.quantization
         if quant is None:
             self.source_mode = "bf16"
         elif (quant.get("bits"), quant.get("group_size"), quant.get("mode")) == (4, 64, "affine"):
@@ -139,8 +142,10 @@ class Qwen36Checkpoint(Checkpoint):
 
     def bits_for(self, name: str) -> int:
         base = name.removesuffix(".weight")
-        quant = self.config.get("quantization_config") or {}
+        quant = self.quantization or {}
         override = quant.get(base, {})
+        if override.get("mode", quant.get("mode", "affine")) != "affine":
+            raise ValueError(f"{base}: unsupported quantization mode")
         if override.get("group_size", 64) != 64:
             raise ValueError(f"{base}: unsupported group size")
         bits = override.get("bits", quant.get("bits", 4))
@@ -156,6 +161,8 @@ class Qwen36Checkpoint(Checkpoint):
                      name.removesuffix("weight") + "scales" in self)
         if quantized:
             bits = self.bits_for(name)
+            if bits != 4 and not name.endswith((".mlp.gate.weight", ".mlp.shared_expert_gate.weight")):
+                raise ValueError(f"{name}: Q4 destination requires 4-bit or BF16 source weights")
             packed = shape[:-1] + (shape[-1] // (32 // bits),)
             parameters = shape[:-1] + (shape[-1] // 64,)
             if actual != packed or self.dtype(name) != "U32":
@@ -189,7 +196,7 @@ class Qwen36Checkpoint(Checkpoint):
         shape = self.shape(name)
         rows = shape[-2]
         stop = rows if stop is None else stop
-        if self.source_mode == "mlx4":
+        if self.dtype(name) != "BF16":
             if self.bits_for(name) != 4:
                 raise ValueError(f"{name}: expected MLX 4-bit")
             return self._quant_parts(name, start, stop, expert)
@@ -200,9 +207,8 @@ class Qwen36Checkpoint(Checkpoint):
     def q8_parts(self, name: str, start: int = 0, stop: int | None = None):
         rows = self.shape(name)[0]
         stop = rows if stop is None else stop
-        if self.source_mode == "mlx4":
-            if self.bits_for(name) != 8:
-                raise ValueError(f"{name}: expected MLX 8-bit")
+        if self.dtype(name) != "BF16":
+            # Four-bit codes also fit losslessly in a Q8 destination.
             return self._quant_parts(name, start, stop)
         return mlx_affine.q8_quantize_parts(super().f32_rows(name, start, stop))
 
@@ -239,6 +245,9 @@ class Qwen36Checkpoint(Checkpoint):
     def validate(self) -> None:
         g = self.geometry
         self._required = set()
+        if "language_model.model.embed_tokens.weight" not in self and any(
+                name.startswith("model.language_model.") for name in self.weight_map):
+            raise ValueError("raw Hugging Face tensor layout is unsupported; export to the MLX layout first (including its norm conversion)")
         self.require("language_model.model.embed_tokens.weight", (g.vocab, g.hidden))
         self.require("language_model.model.norm.weight", (g.hidden,))
         if not g.tied_head:
@@ -490,14 +499,6 @@ def inspect(ck: Qwen36Checkpoint) -> dict:
     }
 
 
-def sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as f:
-        for block in iter(lambda: f.read(4 << 20), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
 def peak_process_ram_bytes() -> int | None:
     """Peak RSS reported by the OS, when available."""
     try:
@@ -508,22 +509,13 @@ def peak_process_ram_bytes() -> int | None:
         return None
 
 
-def assemble(ck: Qwen36Checkpoint, out: Path, reference: Path) -> None:
+def assemble(ck: Qwen36Checkpoint, out: Path, reference: Path, *,
+             source_repo: str | None = None, source_revision: str | None = None,
+             model_name: str | None = None) -> None:
     """Reuse matching non-target assets; target files are always newly encoded."""
-    with (reference / "manifest.json").open(encoding="utf-8") as f:
-        ref = json.load(f)
-    if ref.get("schema_version") != 4 or ref.get("format", {}).get("name") != "splash-packed-q4-moe":
-        raise ValueError("reference must be a Splash Qwen3.6 schema-4 package")
-    with (reference / "tokenizer" / "config.json").open(encoding="utf-8") as f:
-        reference_config = json.load(f)
-    for key in ("model_type", "architectures", "image_token_id"):
-        if ck.config.get(key) != reference_config.get(key):
-            raise ValueError(f"reference vision/tokenizer config differs at {key}")
-    expected = expected_sizes(ck.geometry)
-    recorded = {a["path"]: a["size"] for a in ref["artifacts"]}
-    for name, size in expected.items():
-        if recorded.get(name) != size:
-            raise ValueError(f"reference size mismatch for {name}")
+    source = Path(ck.root)
+    provenance = source_metadata(source, source_repo, source_revision)
+    ref, template = reference_metadata(source, ck.config, reference, expected_sizes(ck.geometry))
     for a in ref["artifacts"]:
         rel = a["path"]
         if rel.startswith(("draft/", "vision/")) or rel == "layout.json":
@@ -534,8 +526,9 @@ def assemble(ck: Qwen36Checkpoint, out: Path, reference: Path) -> None:
                 raise ValueError(f"reference asset hash mismatch: {rel}")
     tok = out / "tokenizer"
     tok.mkdir(exist_ok=True)
-    for name in ("config.json", "tokenizer.json", "tokenizer_config.json", "chat_template.jinja"):
+    for name in ("config.json", "tokenizer.json", "tokenizer_config.json"):
         shutil.copyfile(Path(ck.root) / name, tok / name)
+    (tok / "chat_template.jinja").write_text(template, encoding="utf-8")
     with (tok / "tokenizer.json").open(encoding="utf-8") as f:
         vocabulary = json.load(f)["model"]["vocab"]
     with (tok / "vocab.json").open("w", encoding="utf-8") as f:
@@ -543,8 +536,7 @@ def assemble(ck: Qwen36Checkpoint, out: Path, reference: Path) -> None:
     # Keep execution/draft declarations from the compatible reference; derive
     # the target declaration and all artifact hashes from actual output.
     manifest = {key: ref[key] for key in ("execution_geometry", "format", "draft")}
-    source_id = RAVENX_MLX4_ID if ck.source_mode == "mlx4" else RAVENX_ID
-    manifest.update(schema_version=4, model=Path(ck.root).name,
+    manifest.update(schema_version=4, model=model_name or source.resolve().name,
                     target=dict(architecture="qwen3_5_moe", layers=ck.geometry.layers,
                                 hidden_size=ck.geometry.hidden,
                                 vocabulary_size=ck.geometry.vocab,
@@ -557,12 +549,13 @@ def assemble(ck: Qwen36Checkpoint, out: Path, reference: Path) -> None:
                                 shared_expert_intermediate_size=ck.geometry.shared_hidden,
                                 layer_types=["attention" if x == "full_attention" else "gdn"
                                              for x in ck.geometry.layer_types]),
-                    upstream={"target": {"repo_id": source_id},
+                    upstream={"target": dict(provenance),
                               "draft": ref.get("upstream", {}).get("draft", {}),
                               "vision": ref.get("upstream", {}).get("vision", {}),
-                              "tokenizer": {"repo_id": source_id}},
+                              "tokenizer": dict(provenance)},
                     converter={"source_path": "converter/qwen36_moe.py",
-                               "reference_package": REFERENCE_ID})
+                               "reference_package": ref.get("model", reference.resolve().name),
+                               "reference_manifest_sha256": sha256(reference / "manifest.json")})
     paths = sorted(p for p in out.rglob("*") if p.is_file() and p.name != "manifest.json")
     manifest["artifacts"] = [{"path": p.relative_to(out).as_posix(),
                               "size": p.stat().st_size, "sha256": sha256(p)} for p in paths]
@@ -805,11 +798,14 @@ def validate_tensors(ck: Qwen36Checkpoint, out: Path) -> dict:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="python -m converter.qwen36_moe")
     parser.add_argument("command", choices=("inspect", "build", "assemble", "verify", "validate"))
-    parser.add_argument("--source", required=True, help="local BF16 or MLX 4-bit sharded safetensors directory")
+    parser.add_argument("--source", required=True, help="local MLX-layout BF16 or MLX 4-bit safetensors directory")
     parser.add_argument("--out", help="output Splash package directory")
     parser.add_argument("--reference", help="local official Qwen3.6 Splash package; required for full build")
     parser.add_argument("--target-only", action="store_true", help="build target files without draft/vision")
     parser.add_argument("--resume", action="store_true", help="skip target files with expected size and header")
+    parser.add_argument("--source-repo", help="actual source owner/model ID for provenance (optional for local checkpoints)")
+    parser.add_argument("--source-revision", help="source revision or commit; requires --source-repo")
+    parser.add_argument("--model-name", help="display name in the output manifest; defaults to source folder name")
     parser.add_argument("--model-type", choices=("auto", "qwen36-moe"), default="auto")
     args = parser.parse_args(argv)
     ck = Qwen36Checkpoint(args.source)
@@ -826,11 +822,16 @@ def main(argv=None) -> int:
         print(json.dumps(report, indent=2))
         return 0
     ck.validate()
+    provenance_args = dict(source_repo=args.source_repo, source_revision=args.source_revision,
+                           model_name=args.model_name)
+    source_metadata(Path(ck.root), args.source_repo, args.source_revision)
+    if args.reference and not args.target_only:
+        reference_metadata(Path(ck.root), ck.config, Path(args.reference), expected_sizes(ck.geometry))
     if args.command == "assemble":
         if not args.reference:
             parser.error("assemble requires --reference")
         verify_structure(out, ck.geometry, full=False)
-        assemble(ck, out, Path(args.reference))
+        assemble(ck, out, Path(args.reference), **provenance_args)
         print(json.dumps(verify_structure(out, ck.geometry, full=True), indent=2))
         return 0
     if not args.target_only and not args.reference:
@@ -850,7 +851,7 @@ def main(argv=None) -> int:
     if not args.resume or not completed_target_file(target / "embedding.bin", ck.geometry):
         write_head_embedding(ck, target / "embedding.bin", head=False)
     if not args.target_only:
-        assemble(ck, out, Path(args.reference))
+        assemble(ck, out, Path(args.reference), **provenance_args)
     report = verify_structure(out, ck.geometry, full=not args.target_only)
     report["conversion_seconds"] = round(time.monotonic() - started, 2)
     report["peak_conversion_ram_bytes"] = peak_process_ram_bytes()

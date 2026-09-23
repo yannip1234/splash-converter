@@ -14,7 +14,7 @@ the result is at
 
 ## Usage
 
-For Qwen3.6 MoE and RavenX, see [the schema-4 guide](docs/QWEN36_MOE.md).
+For compatible Qwen3.6-35B-A3B fine-tunes, see [the schema-4 guide](docs/QWEN36_MOE.md).
 The new backend is `python -m converter.qwen36_moe`; the commands below remain
 the Qwen3.8 dense backend.
 
@@ -35,8 +35,11 @@ is produced and the build stops at the first failure.
 - **Works**: any checkpoint with the Qwen3.8-27B layout (64 layers, hidden 5120,
   48 GDN + 16 full-attention), schema 3 / `splash-packed-q4`.
 - **Qwen3.6 MoE**: schema 4 / `splash-packed-q4-moe` has a separate backend in
-  `converter/qwen36_moe.py`. It accepts BF16 or MLX affine 4-bit input; the
-  MLX 8-bit whole-model variant is not accepted.
+  `converter/qwen36_moe.py`. It accepts MLX-layout BF16 or MLX affine 4-bit
+  checkpoints with the supported 35B-A3B geometry, including compatible
+  fine-tunes beyond RavenX. Raw Hugging Face layouts, other architectures,
+  and whole-model MLX 8-bit inputs are not accepted. Full packages require
+  matching source/reference token IDs.
 - `draft/` and `vision/` are byte-copied from an existing package — this converts the
   target model, not the DFlash 2 drafter or the vision tower.
 
